@@ -390,12 +390,14 @@ def main():
                 value = match.group(2)
 
                 if vcp not in capabilities["vcp"].keys():
-                    print(f"Ignoring request {vcp}={value}: Code not supported.")
+                    print(f"Ignoring request {vcp}={value}: VCP code is not supported by this device.")
                     continue
 
+                print(f"Requesting value of VCP {vcp}...")
                 current, maximum = device.get_value(vcp)
+                print(f"Current value of VCP {vcp} is {current} (maximum = {maximum})")
                 if value == "?":
-                    print(f"Read {vcp}={current} (maximum = {maximum})")
+                    pass
                 else:
                     value = int(value, 0)
                     allowed_values = capabilities["vcp"][vcp]
@@ -404,16 +406,16 @@ def main():
                         and value not in allowed_values.keys()
                     ):
                         print(
-                            f"Ignoring request {vcp}={value}: Value not one of the supported items: {list(allowed_values.keys())}"
+                            f"Ignoring request to set VCP {vcp} to {value}: Value not one of the supported items: {list(allowed_values.keys())}"
                         )
                         continue
                     if value > maximum or value < 0:
                         print(
-                            f"Ignoring request {vcp}={value}: Value is outside the range 0..{maximum}"
+                            f"Ignoring request to set VCP {vcp} to {value}: Value is outside the supported range 0..{maximum}"
                         )
                         continue
                     device.set_value(vcp, value)
-                    print(f"Wrote {vcp}={value}")
+                    print(f"Set value of VCP {vcp} to {value}")
                 continue
 
             print(f"Ignoring unexpected command-line argument: {arg}")
