@@ -121,6 +121,9 @@ class DDCDevice:
             print("Read: {}".format(pyftdi.misc.hexline(data)))
         if x != 0:
             raise IOError("Received data with BAD checksum: {})".format(data))
+        # The DDC/CI spec does not indicate any minimum time requied to
+        # sleep after reading, but just to be safe, lets allow some time
+        # to pass.
         time.sleep(sleep * self._sleep_multiplier)
         return data
 
