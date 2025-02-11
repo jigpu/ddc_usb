@@ -7,8 +7,9 @@ Displays which do not provide hardware on-screen-display controls for
 adjusting brightness, contrast, etc. may still allow adjustment through
 software. The `ddcutil` program is often sufficient, but some displays
 use bridge chips that aren't compatible. This program is specifically
-written for the Wacom Cintiq 13HD and Cintiq Pro 24/32 which use the
-Silicon Labs CP210x and FTDI F232H bridge chips respectively.
+written for use with devices using either the Silicon Labs CP210x or
+the FTDI F232H as a bridge chip. Example devices include the Wacom
+Cintiq 13HD (CP210x) and Wacom Cintiq Pro 16/24/32 (F232H).
 
 Usage:
     ddc-ftdi.py <path> dump
@@ -23,6 +24,13 @@ Arguments:
     <VALUE>        Value to assign to the specified VCP. May use the
                    special value "?" to get the current value instead of
                    setting it.
+
+    The exact path required for any given device will depend on the bridge
+    chip in use. Devices using a Silicon Labs CP210x bridge chip should be
+    able to use a serial device node path. Devices which use an FTDI F232H
+    bridge chip, however, will need to use an FTDI URL instead. Check the
+    output of `lsusb` for information about the type of bridge chip that
+    might be in use.
 
     Numeric values may be specified in decimal or hexadecimal (e.g. the
     value "10" may alternatively be specified as "0x0A").
