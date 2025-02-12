@@ -43,7 +43,7 @@ Arguments:
 Examples:
     # Dump the list of capabilities from a monitor at /dev/ttyUSB0
     ddc-ftdi.py /dev/ttyUSB0 dump
-    (prot(monitor)type(LCD)model(Wacom Cintiq 13HD)cmds(01 02 03 07 0C E3 F3)vcp(02 04 08 10 12 14(04 05 08 0B) 16 18 1A 52 6C 6E 70 86(03 08) AC AE B6 C8 DF)mswhql(1)asset_eep(40)mccs_ver(2.1))
+    (prot(monitor)type(LCD)model(Wacom Cintiq 13HD)cmds(01 02 03 07 [...]
 
     # Set brightness (vcp code 0x10) to 10 and contrast (vcp code 12) to 50
     # for a monitor at /dev/ttyUSB0
@@ -57,33 +57,201 @@ Examples:
     ddc-ftdi.py 0x16=?
 """
 
-import serial
+from copy import deepcopy
+import re
+import struct
+import sys
+import time
+
 from pyftdi.i2c import I2cController
 import pyftdi.misc
-import time
-import sys
-import struct
-import re
+import serial
 
-DEBUG = False
+DEBUG = True
 
 
-class DDCDevice:
-    @staticmethod
-    def _checksum(data, addr=0x00):
-        sum = addr
-        for c in data:
-            sum = sum ^ c
-        return sum
+class FtdiDevice:
+    """
+    Abstract low-level representation of a DDC/CI device that is
+    accessible over an FTDI bridge chip.
+    """
 
-    def __init__(self):
+    def __init__(self, url):
+        self._url = url
+        self._i2c_master = None
         self._device_handle = None
+
+    def __enter__(self):
+        i2c = I2cController()
+        i2c.configure(self._url, frequency=100000.0)
+        print(f"Opened i2c connection to {self._url} at {i2c.frequency}Hz")
+        self._device_handle = i2c.get_port(0x37)
+        self._i2c_master = i2c
+        return self
+
+    def __exit__(self, *args):
+        self._i2c_master.close()
+        self._i2c_master = None
+        self._device_handle = None
+
+    def write(self, message):
+        # The hardware bridge implementation will insert the destination
+        # address on its own, so be sure that we do not also write it
+        # ourselves.
+        message = message[1:]
+        self._device_handle.write(message)
+        self._device_handle.flush()
+
+    def read(self, length):
+        return self._device_handle.read(length)
+
+
+class SerialDevice:
+    """
+    Abstract low-level representation of a DDC/CI device that is
+    accessible behind a serial device (e.g. /dev/ttyUSB0).
+    """
+
+    def __init__(self, path):
+        self._path = path
+        self._device_handle = None
+
+    def __enter__(self):
+        ser = serial.Serial(self._path)
+        print("Opened serial connection")
+        self._device_handle = ser
+        return self
+
+    def __exit__(self, *args):
+        self._device_handle.close()
+        self._device_handle = None
+
+    def write(self, message):
+        self._device_handle.write(message)
+        self._device_handle.flush()
+
+    def read(self, length):
+        return self._device_handle.read(length)
+
+
+class DDCInterface:
+    """
+    Interface for interacting with DDC/CI devices.
+
+    This class exposes some of the APIs described in the VESA Display Data
+    Channel Command Interface Standard, Version 1.1.
+    """
+
+    def __init__(self, ddc_device):
+        """
+        Create a new DDC Interface.
+
+        The provided 'ddc_device' must support read and write function
+        calls.
+        """
+        self._ddc_device = ddc_device
         self._retries = 3
         self._sleep_multiplier = 1.5
 
+    def get_value(self, control):
+        """
+        Read the information about the provided VCP control number.
+
+        This function returns a tuple that contains both the current
+        value of the VCP and the maximum value it supports.
+        """
+        # VESA VESA-DDCCI-1.1
+        # Section 4.3 "Get VCP Feature & VCP Feature Reply"
+        if control > 255 or control < 0:
+            raise ValueError(f"Invalid VCP control code {control}")
+        message = b"\x6e\x51\x82\x01" + bytes({control})
+        data = self._query(message, sleep=0.040)
+        maximum = int.from_bytes(data[7:9], "big")
+        value = int.from_bytes(data[9:11], "big")
+        return (value, maximum)
+
+    def set_value(self, control, value):
+        """
+        Set the provided VCP control number to the requested value.
+        """
+        # VESA VESA-DDCCI-1.1
+        # Section 4.4 "Set VCP Feature"
+        if control > 255 or control < 0:
+            raise ValueError(f"Invalid VCP control code {control}")
+        control_bytes = control.to_bytes(1, "big")
+        value_bytes = value.to_bytes(2, "big")
+        message = b"\x6e\x51\x84\x03" + control_bytes + value_bytes
+        self._write(message, sleep=0.050)
+
+    def save_settings(self):
+        """
+        Request the display save the current adjustment data (e.g. to
+        EEPROM or other non-volatile storage).
+        """
+        # VESA VESA-DDCCI-1.1
+        # Section 4.5 "Save Current Settings"
+        message = b"\x6e\x51\x81\x0c"
+        self._write(message, sleep=0.200)
+
+    def request_capabilities(self):
+        """
+        Request the display's capabilities string.
+        """
+        # VESA-DDCCI-1.1
+        # Section 4.6 "Capabilities Request & Capabilities Reply"
+        result = b""
+        offset = 0
+        while True:
+            message = b"\x6e\x51\x83\xf3" + struct.pack(">h", offset)
+            self._write(message, sleep=0.040)
+            data = self._read(sleep=0.050)
+            payload = data[6:-1]
+            if len(payload) == 0:
+                break
+            result += payload
+            offset += len(payload)
+        return str(result, "ASCII")
+
+    @staticmethod
+    def _checksum(data, destination_address=None):
+        r"""
+        Calculate the DDC/CI checksum of a chunk of data.
+
+        DDC/CI uses a simple XOR checksum of all message bytes, including
+        the source and destination addresses. If an destination address
+        is provided to this function, that value will replace the first
+        message byte when calculating the checksum (this is to handle
+        checksums that are supposed to be calculated with the "0x50
+        virtual host address").
+
+        >>> DDCInterface._checksum(b'\x01\x02')
+        3
+        >>> DDCInterface._checksum(b'\x01\x02\x03')
+        0
+        >>> DDCInterface._checksum(b'\x01\x02', destination_address=0x50)
+        82
+        >>> DDCInterface._checksum(b'\x01\x02\x03', destination_address=0x50)
+        81
+        """
+        # VESA VESA-DDCCI-1.1
+        # Section 1.6 "I2C Bus Notation"
+        checksum = 0
+        for c in data:
+            checksum = checksum ^ c
+        if destination_address is not None:
+            checksum = checksum ^ data[0] ^ destination_address
+        return checksum
+
     def _retry(self, fn, sleep=0.040):
+        """
+        Repeatedly call the provided function until it either does not
+        raise an exception, or the number maximum number of attempts is
+        exceeded.
+        """
+        # VESA VESA-DDCCI-1.1
+        # Section 5 "Communication Protocol"
         saved_exception = None
-        for attempt in range(0, self._retries):
+        for attempt in range(0, self._retries + 1):
             try:
                 return fn()
             except Exception as e:
@@ -93,118 +261,259 @@ class DDCDevice:
                 time.sleep(sleep * self._sleep_multiplier)
         raise saved_exception
 
-    def write(self, message, sleep, include_address=True):
-        fn = lambda m=message, s=sleep, i=include_address: self._write_once(m, s, i)
+    def _write(self, message, sleep):
+        """
+        Attempt to write the provided message to the DDC/CI device.
+
+        This method will sleep for the requested amount of time after
+        a write to allow the DDC/CI device to process the write. Retries
+        will be attempted in the case of a failure.
+        """
+        fn = lambda m=message, s=sleep: self._write_once(m, s)
         return self._retry(fn)
 
-    def _write_once(self, message, sleep, include_address=True):
-        x = message + bytes({DDCDevice._checksum(message)})
-        if not include_address:
-            x = x[1:]
+    def _write_once(self, message, sleep):
+        """
+        Attempt to write the provided message to the DDC/CI device.
+
+        This method will sleep for the requested amount of time after
+        a write to allow the DDC/CI device to process the write. Retries
+        will *NOT* be attempted in the case of a failure.
+        """
+        x = message + bytes({DDCInterface._checksum(message)})
         if DEBUG:
-            print("Writing: {}".format(pyftdi.misc.hexline(x)))
-        self._device_handle.write(x)
-        self._device_handle.flush()
+            print(f"Writing: {pyftdi.misc.hexline(x)}")
+        self._ddc_device.write(x)
         time.sleep(sleep * self._sleep_multiplier)
 
-    def read(self, sleep):
+    def _read(self, sleep):
+        """
+        Attempt to read the next message from the DDC/CI device.
+
+        This method will sleep for the requested amount of time after
+        a read to allow the DDC/CI device to produce more data. Retries
+        will be attempted in the case of a failure.
+        """
         fn = lambda: self._read_once(sleep)
         return self._retry(fn)
 
     def _read_once(self, sleep):
-        data = self._device_handle.read(2)
-        if data[0] != 0x6E:
-            raise IOError("Unexpected reply from address {}".format(data[0]))
-        data = data + self._device_handle.read((data[1] & 0x7F) + 1)
-        x = DDCDevice._checksum(data, 0x50)
+        """
+        Attempt to read the next message from the DDC/CI device.
+
+        This method will sleep for the requested amount of time after
+        a read to allow the DDC/CI device to produce more data. Retries
+        will *NOT* be attempted in the case of a failure.
+
+        This function will only accept messages containing a source
+        address of 0x6E.
+
+        This function will return the entire message received from a
+        DDC/CI device, starting at the "destination address".
+        """
+        # Pre-fill the buffer with the (assumed) destination address since
+        # the device handles do not provide this information on read().
+        data = b"\x6F"
+        data = data + self._ddc_device.read(2)
+        if data[1] != 0x6E:
+            raise IOError(f"Unexpected reply from address {data[1]}")
+        data = data + self._ddc_device.read((data[2] & 0x7F) + 1)
+        x = DDCInterface._checksum(data, 0x50)
         if DEBUG:
-            print("Read: {}".format(pyftdi.misc.hexline(data)))
+            print(f"Read: {pyftdi.misc.hexline(data)}")
         if x != 0:
-            raise IOError("Received data with BAD checksum: {})".format(data))
-        # The DDC/CI spec does not indicate any minimum time requied to
-        # sleep after reading, but just to be safe, lets allow some time
-        # to pass.
+            raise IOError(f"Received data with BAD checksum: {data})")
         time.sleep(sleep * self._sleep_multiplier)
         return data
 
-    def query(self, message, sleep):
-        self.write(message, sleep)
-        return self.read(sleep)
+    def _query(self, message, sleep):
+        """
+        Write to the DDC/CI device and read a response.
 
-    def close(self):
-        self._device_handle.close()
-
-
-class FtdiDevice(DDCDevice):
-    def __init__(self, url):
-        super().__init__()
-        i2c = I2cController()
-        i2c.configure(url, frequency=100000.0)
-        print("Opened i2c connection to {} at {}Hz".format(url, i2c.frequency))
-        self._device_handle = i2c.get_port(0x37)
-        self._i2c_master = i2c
-
-    def write(self, message, sleep):
-        super().write(message, sleep, False)
-
-    def close(self):
-        self._i2c_master.close()
+        Retries will be attempted in the case of a failure.
+        """
+        self._write(message, sleep)
+        return self._read(sleep)
 
 
-class SerialDevice(DDCDevice):
-    def __init__(self, path):
-        super().__init__()
-        ser = serial.Serial(path)
-        print("Opened serial connection")
-        self._device_handle = ser
+class VCPCode:
+    codes = [
+        (0x01, "degauss", None),
+        (0x02, "new-control-value", None),
+        (0x03, "soft-controls", None),
+        (0x04, "restore-factory-defaults", None),
+        (0x05, "restore-factory-brightness-contrast", None),
+        (0x06, "restore-factory-geometry", None),
+        (0x08, "restore-factory-color", None),
+        (0x0A, "restore-factory-tv", None),
+        (0x0B, "color-temperature-increment", None),
+        (0x0C, "color-temperature-request", None),
+        (0x0E, "clock", None),
+        (0x10, "brightness", None),
+        (0x11, "flesh-tone-enhancement", None),
+        (0x12, "contrast", None),
+        (0x13, "backlight-control", None),
+        (
+            0x14,
+            "color-preset",
+            [
+                (0x01, "srgb", None),
+                (0x02, "native", None),
+                (0x03, "4000K", None),
+                (0x04, "5000K", None),
+                (0x05, "6500K", None),
+                (0x06, "7500K", None),
+                (0x07, "8200K", None),
+                (0x08, "9300K", None),
+                (0x09, "10000K", None),
+                (0x0A, "11500K", None),
+                (0x0B, "User 1", None),
+                (0x0C, "User 2", None),
+                (0x0D, "User 3", None),
+            ],
+        ),
+        (0x16, "video-gain-r", None),
+        (0x17, "color-vision-compensation", None),
+        (0x18, "video-gain-g", None),
+        (0x1A, "video-gain-b", None),
+        (0x1C, "focus", None),
+        (
+            0x1E,
+            "auto-setup",
+            [
+                (0x00, "not-active", None),
+                (0x01, "in-progress", None),
+                (0x02, "continuous-periodic", None),
+            ],
+        ),
+        (
+            0x1F,
+            "auto-color-setup",
+            [
+                (0x00, "not-active", None),
+                (0x01, "in-progress", None),
+                (0x02, "continuous-periodic", None),
+            ],
+        ),
+        (0x20, "horizontal-position", None),
+        (0x22, "horizontal-size", None),
+        (0x24, "horizontal-pincushion", None),
+        (0x26, "horizontal-pincushion-balance", None),
+        (0x28, "horizontal-convergence-rb", None),
+        (0x29, "horizontal-convergence-mg", None),
+        (0x2A, "horizontal-linearity", None),
+        (0x2C, "horizontal-linearity-balance", None),
+        (0x2E, "gray-scale-expansion", None),
+        (0x30, "vertical-position", None),
+        (0x32, "vertical-size", None),
+        (0x34, "veritcal-pincushion", None),
+        (0x36, "veritcal-pincushion-balance", None),
+        (0x38, "veritcal-convergence-rb", None),
+        (0x39, "veritcal-convergence-mg", None),
+        (0x3A, "veritcal-linearity", None),
+        (0x3C, "veritcal-linearity-balance", None),
+        (0x3E, "clock-phase", None),
+        (0x40, "horizontal-parallelogram", None),
+        (0x41, "vertical-parallelogram", None),
+        (0x42, "horizontal-keystone", None),
+        (0x43, "vertical-keystone", None),
+        (0x44, "rotation", None),
+        (0x46, "top-corner-flare", None),
+        (0x48, "top-corner-hook", None),
+        (0x4A, "bottom-corner-flare", None),
+        (0x4C, "bottom-corner-hook", None),
+        (0x52, "active-control", None),
+        (0x54, "performance-preservation", None),
+        (0x56, "horizontal-moire", None),
+        (0x58, "vertical-moire", None),
+        (0x59, "six-axis-saturation-r", None),
+        (0x5A, "six-axis-saturation-y", None),
+        (0x5B, "six-axis-saturation-g", None),
+        (0x5C, "six-axis-saturation-c", None),
+        (0x5D, "six-axis-saturation-b", None),
+        (0x5E, "six-axis-saturation-m", None),
+        (
+            0x60,
+            "input-source",
+            [
+                (0x01, "vga-1", None),
+                (0x02, "vga-2", None),
+                (0x03, "dvi-1", None),
+                (0x04, "dvi-2", None),
+                (0x05, "composite-1", None),
+                (0x06, "composite-2", None),
+                (0x07, "svideo-1", None),
+                (0x08, "svideo-2", None),
+                (0x09, "tuner-1", None),
+                (0x0A, "tuner-2", None),
+                (0x0B, "tuner-3", None),
+                (0x0C, "component-1", None),
+                (0x0D, "component-2", None),
+                (0x0E, "component-3", None),
+                (0x0F, "dp-1", None),
+                (0x10, "dp-2", None),
+                (0x11, "hdmi-1", None),
+                (0x12, "hdmi-2", None),
+            ],
+        ),
+    ]
 
+    @staticmethod
+    def _item_lookup(code, value):
+        for item in VCPCode.codes:
+            if item[0] == code:
+                if value is None:
+                    return item
+                for entry in item[2]:
+                    if entry[0] == value:
+                        return entry
+                return None
+        return None
 
-class DDCInterface:
-    def __init__(self, ddc_device):
-        self._ddc_device = ddc_device
+    @staticmethod
+    def _name_lookup(code, value):
+        for item in VCPCode.codes:
+            if code in [item[0], item[1]]:
+                if value is None:
+                    return item
+                for entry in item[2]:
+                    if value in [entry[0], entry[1]]:
+                        return entry
+                return None
+        return None
 
-    def close(self):
-        self._ddc_device.close()
+    @staticmethod
+    def code_to_name(code):
+        item = VCPCode._item_lookup(code, None)
+        if item is not None:
+            return item[1]
+        return code
 
-    def get_value(self, control):
-        # VESA VESA-DDCCI-1.1
-        # Section 4.3 "Get VCP Feature & VCP Feature Reply"
-        message = b"\x6e\x51\x82\x01" + bytes({control})
-        data = self._ddc_device.query(message, sleep=0.040)
-        return (data[9], data[7])
+    @staticmethod
+    def code_value_to_name(code, value):
+        item = VCPCode._item_lookup(code, value)
+        if item is not None:
+            return item[1]
+        return value
 
-    def set_value(self, control, value):
-        # VESA VESA-DDCCI-1.1
-        # Section 4.4 "Set VCP Feature"
-        message = b"\x6e\x51\x84\x03" + bytes({control}) + b"\x00" + bytes({value})
-        self._ddc_device.write(message, sleep=0.050)
+    @staticmethod
+    def name_to_code(codename):
+        item = VCPCode._name_lookup(codename, None)
+        if item is not None:
+            return item[0]
+        return None
 
-    def save_settings(self):
-        # VESA VESA-DDCCI-1.1
-        # Section 4.5 "Save Current Settings"
-        message = b"\x6e\x51\x81\x0c"
-        self._ddc_device.write(message, sleep=0.200)
-
-    def request_features(self):
-        # VESA-DDCCI-1.1
-        # Section 4.6 "Capabilities Request & Capabilities Reply"
-        result = b""
-        offset = 0
-        while True:
-            message = b"\x6e\x51\x83\xf3" + struct.pack(">h", offset)
-            self._ddc_device.write(message, sleep=0.050)
-            data = self._ddc_device.read(sleep=0.040)
-            payload = data[5:-1]
-            if len(payload) == 0:
-                break
-            result += payload
-            offset += len(payload)
-        return str(result, "ASCII")
+    @staticmethod
+    def name_to_code_value(codename, valuename):
+        item = VCPCode._name_lookup(codename, valuename)
+        if item is not None:
+            return item[0]
+        return None
 
 
 class DDCParser:
     @staticmethod
-    def _find_next_char(str, match, pos):
+    def _find_next_char(source, match, pos):
         """
         Search the input string for any of the requested "match" characters.
 
@@ -214,14 +523,14 @@ class DDCParser:
         >>> DDCParser._find_next_char("1 (A B)", "()", 0)
         2
         """
-        char_indicies = [str.find(x, pos) for x in match]
+        char_indicies = [source.find(x, pos) for x in match]
         valid_indicies = [idx for idx in char_indicies if idx >= 0]
         if len(valid_indicies) == 0:
             return -1
         return min(valid_indicies)
 
     @staticmethod
-    def _parse_tree(str, sep="", pos=0):
+    def _parse_tree(source, sep="", pos=0):
         """
         Parse a string of paren-nested nodes into a nested list.
 
@@ -247,24 +556,24 @@ class DDCParser:
         [['1', '2', '3', ['a', 'b']]]
         """
         result = []
-        while pos < len(str):
+        while pos < len(source):
             # print(f"Scanning for next tree token after pos={pos}")
-            token_idx = DDCParser._find_next_char(str, "()" + sep, pos)
+            token_idx = DDCParser._find_next_char(source, "()" + sep, pos)
             if token_idx == -1:
-                result.append(str[pos:])
+                result.append(source[pos:])
                 return result
-            elif str[token_idx] == "(":
+            elif source[token_idx] == "(":
                 if pos != token_idx:
-                    result.append(str[pos:token_idx])
-                child, pos = DDCParser._parse_tree(str, sep, token_idx + 1)
+                    result.append(source[pos:token_idx])
+                child, pos = DDCParser._parse_tree(source, sep, token_idx + 1)
                 result.append(child)
-            elif str[token_idx] == ")":
+            elif source[token_idx] == ")":
                 if pos != token_idx:
-                    result.append(str[pos:token_idx])
+                    result.append(source[pos:token_idx])
                 return (result, token_idx + 1)
             else:
                 if pos != token_idx:
-                    result.append(str[pos:token_idx])
+                    result.append(source[pos:token_idx])
                 pos = token_idx + 1
         return result
 
@@ -336,28 +645,27 @@ class DDCParser:
         return result
 
     @staticmethod
-    def parse_capabilities(str):
+    def parse_capabilities(raw_capabilities):
         """
-		Parse the capabilities string returned from DDC/CI into a nested-
-		dictionary structure that we can query.
+        Parse the capabilities string returned from DDC/CI into a nested-
+        dictionary structure that we can query.
 
-		## Examples:
-		>>> str = "(prot(monitor)type(LCD)model(Wacom Cintiq 13HD) " \
-				  "cmds(01 02 03 07 0C E3 F3)vcp(02 04 08 10 12 14 " \
-				  "(04 05 08 0B) 16 18 1A 52 6C 6E 70 86(03 08) AC " \
-				  "AE B6 C8 DF)mswhql(1)asset_eep(40)mccs_ver(2.1))"
-		>>> DDCParser.parse_capabilities(str)
-		{'prot': 'monitor', 'type': 'LCD', 'model': 'Wacom Cintiq 13HD', \
+        ## Examples:
+        >>> raw_capabilities = "(prot(monitor)type(LCD)model(Wacom Cintiq \
+13HD)cmds(01 02 03 07 0C E3 F3)vcp(02 04 08 10 12 14(04 05 08 0B) 16 18 1A \
+52 6C 6E 70 86(03 08) AC AE B6 C8 DF)mswhql(1)asset_eep(40)mccs_ver(2.1))"
+        >>> DDCParser.parse_capabilities(raw_capabilities)
+        {'prot': 'monitor', 'type': 'LCD', 'model': 'Wacom Cintiq 13HD', \
 'cmds': {1: None, 2: None, 3: None, 7: None, 12: None, 227: None, \
 243: None}, 'vcp': {2: None, 4: None, 8: None, 16: None, 18: None, \
 20: {4: None, 5: None, 8: None, 11: None}, 22: None, 24: None, \
 26: None, 82: None, 108: None, 110: None, 112: None, 134: {3: None, \
 8: None}, 172: None, 174: None, 182: None, 200: None, 223: None}, \
 'mswhql': '1', 'asset_eep': '40', 'mccs_ver': '2.1'}
-		"""
+        """
         result = {}
 
-        tree = DDCParser._parse_tree(str, " ")
+        tree = DDCParser._parse_tree(raw_capabilities, " ")
         if len(tree) != 1:
             raise ValueError("Unexpected data outside of capabilities root")
 
@@ -373,6 +681,34 @@ class DDCParser:
             result[node] = value
         return result
 
+    @staticmethod
+    def rename_capabilities(tree):
+        """
+        Replace numeric VCP IDs in a parsed capabilities tree with user-
+        friendly names instead.
+        """
+        vcptree = {}
+        codes = tree["vcp"].keys()
+        for code in codes:
+            codename = VCPCode.code_to_name(code)
+            vcptree[codename] = None
+
+            values = tree["vcp"][code]
+            if values is not None:
+                vcptree[codename] = {}
+                for value in values:
+                    valuename = VCPCode.code_value_to_name(code, value)
+                    vcptree[codename][valuename] = deepcopy(tree["vcp"][code][value])
+        result = deepcopy(tree)
+        result["vcp"] = vcptree
+        return result
+
+
+def get_ddc_device(path):
+    if path.startswith("ftdi://"):
+        return FtdiDevice(path)
+    return SerialDevice(path)
+
 
 def main():
     if len(sys.argv) <= 2:
@@ -380,58 +716,84 @@ def main():
         return
 
     path = sys.argv[1]
-    if path.startswith("ftdi://"):
-        device = DDCInterface(FtdiDevice(path))
-    else:
-        device = DDCInterface(SerialDevice(path))
 
-    try:
+    with get_ddc_device(path) as device:
+        interface = DDCInterface(device)
         print("Requesting features...")
-        features = device.request_features()
-        capabilities = DDCParser.parse_capabilities(features)
+        raw_capabilities = interface.request_capabilities()
+        numeric_capabilities = DDCParser.parse_capabilities(raw_capabilities)
+        human_capabilities = DDCParser.rename_capabilities(numeric_capabilities)
 
         for arg in sys.argv[2:]:
             if arg == "dump":
-                print(features)
+                print(raw_capabilities)
+                continue
+
+            if arg == "list":
+                print(human_capabilities)
                 continue
 
             match = re.match(r"(.+)=(.+)", arg)
             if match is not None:
-                vcp = int(match.group(1), 0)
+                vcp = match.group(1)
                 value = match.group(2)
+                vcpcode = None
+                valuecode = None
 
-                if vcp not in capabilities["vcp"].keys():
-                    print(f"Ignoring request {vcp}={value}: VCP code is not supported by this device.")
+                try:
+                    vcpcode = int(vcp, 0)
+                except ValueError:
+                    vcpcode = VCPCode.name_to_code(vcp)
+                    if vcpcode is None:
+                        print("Ignoring unrecognized VCP code '{vcp}'")
+                        continue
+
+                try:
+                    if value == "?":
+                        valuecode = "?"
+                    else:
+                        valuecode = int(value, 0)
+                except ValueError:
+                    valuecode = VCPCode.name_to_code_value(vcp, value)
+                    if valuecode is None:
+                        print("Ignoring unrecognized VCP value '{value}'")
+                        continue
+
+                if str(vcp) != str(vcpcode) or str(value) != str(valuecode):
+                    print(f"Interpreting {vcp}={value} as {vcpcode}={valuecode}")
+
+                if vcpcode not in numeric_capabilities["vcp"].keys():
+                    print(
+                        f"Ignoring request {vcp}={value}: VCP code is not supported by this device."
+                    )
                     continue
 
                 print(f"Requesting value of VCP {vcp}...")
-                current, maximum = device.get_value(vcp)
+                current, maximum = interface.get_value(vcpcode)
+                current = VCPCode.code_value_to_name(vcpcode, current)
                 print(f"Current value of VCP {vcp} is {current} (maximum = {maximum})")
                 if value == "?":
                     pass
                 else:
-                    value = int(value, 0)
-                    allowed_values = capabilities["vcp"][vcp]
+                    allowed_values = numeric_capabilities["vcp"][vcpcode]
                     if (
                         allowed_values is not None
-                        and value not in allowed_values.keys()
+                        and valuecode not in allowed_values.keys()
                     ):
                         print(
                             f"Ignoring request to set VCP {vcp} to {value}: Value not one of the supported items: {list(allowed_values.keys())}"
                         )
                         continue
-                    if value > maximum or value < 0:
+                    if valuecode > maximum or valuecode < 0:
                         print(
                             f"Ignoring request to set VCP {vcp} to {value}: Value is outside the supported range 0..{maximum}"
                         )
                         continue
-                    device.set_value(vcp, value)
+                    interface.set_value(vcpcode, valuecode)
                     print(f"Set value of VCP {vcp} to {value}")
                 continue
 
             print(f"Ignoring unexpected command-line argument: {arg}")
-    finally:
-        device.close()
 
 
 if __name__ == "__main__":
