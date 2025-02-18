@@ -172,9 +172,9 @@ class DDCInterface:
         message = b"\x6e\x51\x82\x01" + bytes({control})
         data = self._query(message, sleep=0.040)
         if len(data) != 12:
-            raise ValueError(f"Received reply of unexpected length")
+            raise ValueError("Received reply of unexpected length")
         if data[3] != 0x02:
-            raise ValueError(f"Received reply of unexpected opcode")
+            raise ValueError("Received reply of unexpected opcode")
         result = {
             "errno": data[4],
             "opcode": data[5],
@@ -335,7 +335,7 @@ class DDCInterface:
             print(f"Read: {pyftdi.misc.hexline(data)}")
         if x != 0:
             raise IOError(f"Received data with BAD checksum: {data})")
-        if data == b'\x6f\x6e\x80\xbe':
+        if data == b"\x6f\x6e\x80\xbe":
             raise IOError("Received NULL message")
         time.sleep(sleep * self._sleep_multiplier)
         return data
