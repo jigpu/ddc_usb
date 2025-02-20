@@ -16,6 +16,6 @@ git archive HEAD \
     --prefix=ddc_usb/ \
     --add-file requirements.txt \
     -o "ddc_usb-${COMMIT_ID}.tar.gz" \
-    ":!dist.sh"
+    ":!dist.sh" ":!.gitignore"
 
 rm requirements.txt
