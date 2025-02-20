@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Copyright 2025 Jason Gerecke <jason.gerecke@wacom.com>
+# Copyright 2025 Wacom Co., Ltd.
+#
+# See the NOTICE file distributed with this work for additional information
+# regarding copyright ownership.
+
 """Control brightness, contrast, and other controls of monitors that
 expose their DDC/CI over USB.
 
