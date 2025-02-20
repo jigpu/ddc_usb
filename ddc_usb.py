@@ -1150,7 +1150,7 @@ class DDCSession:
             print(f"Display does not recognize VCP {vcp}")
             return
         if result["opcode"] != vcpcode:
-            print(f"Ignoring unexpected response for VCP {result["opcode"]}")
+            print(f"Ignoring unexpected response for VCP {result['opcode']}")
             return
 
         current = result["value"]
