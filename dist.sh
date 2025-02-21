@@ -12,7 +12,8 @@ pip3 freeze --local > requirements.txt
 
 
 COMMIT_ID=$(git describe --abbrev HEAD)
-git archive HEAD \
+git -c tar.umask=022 \
+    archive HEAD \
     --prefix=ddc_usb/ \
     --add-file requirements.txt \
     -o "ddc_usb-${COMMIT_ID}.tar.gz" \
