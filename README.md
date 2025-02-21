@@ -21,12 +21,12 @@ expose their DDC/CI over USB.
 ## Usage
 
 USB device access often requires admin priviliges. We recommend running
-the `ddc_usb.sh` script either as root or with a tool like "sudo". This
+the `ddc_usb` script either as root or with a tool like "sudo". This
 will both ensure you have proper permission and that the program has
 access to its required virtual environment.
 
 
 ## Examples
 
-Run the `ddc_usb.sh` script without any arguments for "help" output and
+Run the `ddc_usb` script without any arguments for "help" output and
 a list of practical examples.

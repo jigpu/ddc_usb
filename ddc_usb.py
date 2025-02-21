@@ -20,9 +20,9 @@ the FTDI F232H as a bridge chip. Example devices include the Wacom
 Cintiq 13HD (CP210x) and Wacom Cintiq Pro 16/24/32 (F232H).
 
 Usage:
-    ddc-ftdi.py <path> dump
-    ddc-ftdi.py <path> list
-    ddc-ftdi.py <path> <VCP=VALUE> [...]
+    ddc_usb <path> dump
+    ddc_usb <path> list
+    ddc_usb <path> <VCP=VALUE> [...]
 
 Arguments:
     <path>         Path to the device to be controlled. Must be either
@@ -53,22 +53,22 @@ Arguments:
 
 Examples:
     # Dump the list of capabilities from a monitor at /dev/ttyUSB0
-    ddc-ftdi.py /dev/ttyUSB0 dump
+    ddc_usb /dev/ttyUSB0 dump
     (prot(monitor)type(LCD)model(Wacom Cintiq 13HD)cmds(01 02 03 07 [...]
 
     # Set brightness to 10 and contrast to 50 for a monitor at /dev/ttyUSB0
-    ddc-ftdi.py /dev/ttyUSB0 brightness=10 contrast=50
+    ddc_usb /dev/ttyUSB0 brightness=10 contrast=50
 
     # Set brightness (vcp code 0x10) to 10 and contrast (vcp code 0x12) to 50
     # for a monitor at /dev/ttyUSB0
-    ddc-ftdi.py /dev/ttyUSB0 0x10=10 0x12=50
+    ddc_usb /dev/ttyUSB0 0x10=10 0x12=50
 
     # Change color preset to 6500K for a monitor at ftdi://ftdi:232h/1
-    ddc-ftdi.py ftdi://ftdi:232h/1 select-color-preset=6500-k
+    ddc_usb ftdi://ftdi:232h/1 select-color-preset=6500-k
 
     # Print the current brightness, change it to 50, and print it again
     # for a monitor at ftdi://ftdi:232h/1.
-    ddc-ftdi.py ftdi://ftdi:232h/1 brightness=? brightness=50 brightness=?
+    ddc_usb ftdi://ftdi:232h/1 brightness=? brightness=50 brightness=?
 """
 
 import re
