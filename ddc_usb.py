@@ -25,9 +25,10 @@ Usage:
     ddc_usb <path> <VCP=VALUE> [...]
 
 Arguments:
-    <path>         Path to the device to be controlled. Must be either
-                   a serial device node (e.g. `/dev/ttyUSB0`) or a PyFtdi
-                   URL (e.g. `ftdi://ftdi:232h/1`).
+    <path>         Path to the device to be controlled. Supported devices
+                   include a serial device nodes (e.g. `/dev/ttyUSB0`),
+                   PyFtdi URLs (e.g. `ftdi://ftdi:232h/1`), and I2C device
+                   nodes (e.g. `/dev/i2c-3`).
     dump           Instruct the program to dump the raw capability list
     list           Instruct the program to list the device capabilities
     <VCP>          "Virtual Control Panel" code or name.
@@ -79,6 +80,7 @@ import time
 from pyftdi.i2c import I2cController
 import pyftdi.misc
 import serial
+from smbus2 import SMBus, i2c_msg
 
 DEBUG = False
 
@@ -145,6 +147,36 @@ class SerialDevice:
 
     def read(self, length):
         return self._device_handle.read(length)
+
+
+class I2cDevice:
+    """
+    Abstract low-level representation of a DDC/CI device that is
+    accessible via an I2C device node.
+    """
+
+    def __init__(self, path):
+        self._path = path
+        self._bus = None
+
+    def __enter__(self):
+        self._bus = SMBus(self._path)
+        print(f"Opened i2c connection to {self._path}")
+        return self
+
+    def __exit__(self, *args):
+        self._bus.close()
+        self._bus = None
+
+    def write(self, message):
+        # Remove address from message before writing
+        request = i2c_msg.write(0x37, message[1:])
+        self._bus.i2c_rdwr(request)
+
+    def read(self, length):
+        rd = i2c_msg.read(0x37, length)
+        self._bus.i2c_rdwr(rd)
+        return bytes(rd)
 
 
 class DDCInterface:
@@ -1090,6 +1122,8 @@ class DDCSession:
     def _get_ddc_device(path):
         if path.startswith("ftdi://"):
             return FtdiDevice(path)
+        elif path.startswith("/dev/i2c-"):
+            return I2cDevice(path)
         return SerialDevice(path)
 
     def __enter__(self):
